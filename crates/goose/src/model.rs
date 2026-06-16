@@ -340,7 +340,13 @@ impl ModelConfig {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| fast_model_name.to_string());
-        let fast_config = ModelConfig::new(&name)?.with_canonical_limits(provider_name);
+        // Disable thinking via an explicit "off" effort rather than clearing the
+        // `reasoning` capability flag, so providers still recognize the model as
+        // reasoning-capable (e.g. OpenRouter still emits reasoning {effort: none}
+        // to actually turn it off, and temperature gating stays correct).
+        let fast_config = ModelConfig::new(&name)?
+            .with_canonical_limits(provider_name)
+            .with_thinking_effort(ThinkingEffort::Off);
         self.fast_model_config = Some(Box::new(fast_config));
         Ok(self)
     }
@@ -469,6 +475,10 @@ impl ModelConfig {
                 serde_json::json!(effort.to_string()),
             );
         }
+    }
+
+    pub fn reasoning_disabled(&self) -> bool {
+        self.reasoning == Some(false) || self.thinking_effort() == Some(ThinkingEffort::Off)
     }
 
     pub fn thinking_effort(&self) -> Option<ThinkingEffort> {
@@ -665,6 +675,38 @@ mod tests {
         assert_eq!(fast_config.context_limit, Some(4096));
         assert_eq!(fast_config.max_tokens, Some(1024));
         assert_eq!(config.use_fast_model().model_name, "fast-model");
+    }
+
+    #[test]
+    fn with_fast_disables_thinking_even_when_effort_set() {
+        let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", Some("high"))]);
+        let config = ModelConfig::new("claude-sonnet-4-5")
+            .unwrap()
+            .with_fast("claude-haiku-4-5", "anthropic")
+            .unwrap();
+        let fast = config.use_fast_model();
+
+        // Thinking is disabled via an explicit Off effort, but the model stays
+        // recognized as reasoning-capable so providers can emit their "off" token.
+        assert_eq!(fast.thinking_effort(), Some(ThinkingEffort::Off));
+        assert!(fast.is_reasoning_model());
+    }
+
+    #[test]
+    fn reasoning_disabled_for_off_effort_or_non_reasoning_capability() {
+        let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", Some("high"))]);
+
+        // Explicit Off effort (how fast-model configs disable thinking).
+        let config = ModelConfig::new("gpt-5")
+            .unwrap()
+            .with_thinking_effort(ThinkingEffort::Off);
+        assert_eq!(config.thinking_effort(), Some(ThinkingEffort::Off));
+        assert!(config.reasoning_disabled());
+
+        // Capability metadata marking the model non-reasoning also counts.
+        let mut config = ModelConfig::new("gpt-5").unwrap();
+        config.reasoning = Some(false);
+        assert!(config.reasoning_disabled());
     }
 
     mod thinking_effort_tests {
